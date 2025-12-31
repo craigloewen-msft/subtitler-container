@@ -217,6 +217,7 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
                 "text_en": text_en,
                 "language": detected_language
             }
+            logger.info(f"Sending subtitle segment {segment_count}: {subtitle_event['start']:.2f}s - {subtitle_event['end']:.2f}s")
             await websocket.send_text(json.dumps(subtitle_event))
             full_text_parts.append(orig_segment.text)
             full_text_en_parts.append(text_en)
@@ -261,54 +262,184 @@ async def websocket_endpoint(websocket: WebSocket):
     transcription_task = None
     cancel_event = asyncio.Event()
     
+    # State for chunked audio loading
+    audio_chunks = []
+    expected_total_size = 0
+    expected_chunk_count = 0
+    receiving_chunks = False
+    
     try:
         while True:
-            # Receive command
-            message_text = await websocket.receive_text()
-            command = json.loads(message_text)
-            command_type = command.get("type")
+            # Receive either text or binary message
+            message = await websocket.receive()
             
-            if command_type == "load":
-                # Load audio data
-                audio_base64 = command.get("audio_data")
-                if not audio_base64:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "audio_data is required for load command"
-                    }))
+            # Handle binary chunks
+            if "bytes" in message:
+                binary_data = message["bytes"]
+                logger.info(f"Received binary chunk of {len(binary_data)} bytes")
+                
+                if not receiving_chunks:
+                    logger.warning("Received binary data but not in chunk receiving mode")
                     continue
+                
+                audio_chunks.append(binary_data)
+                logger.info(f"Accumulated {len(audio_chunks)} chunks, total size: {sum(len(c) for c in audio_chunks)} bytes")
+                continue
+            
+            # Handle text commands
+            message_text = message.get("text", "")
+            logger.info(f"Received websocket message: {message_text[:200]}...")  # Log first 200 chars
+            
+            try:
+                command = json.loads(message_text)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON message: {e}")
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": f"Invalid JSON: {str(e)}"
+                }))
+                continue
+            
+            command_type = command.get("type")
+            logger.info(f"Processing command type: {command_type}")
+            
+            if command_type == "load_start":
+                # Start receiving chunked audio data
+                logger.info("Processing 'load_start' command...")
+                expected_total_size = command.get("total_size", 0)
+                expected_chunk_count = command.get("chunk_count", 0)
+                
+                logger.info(f"Expecting {expected_chunk_count} chunks, total size: {expected_total_size} bytes ({expected_total_size / 1024 / 1024:.2f} MB)")
                 
                 # Cancel any existing transcription
                 if transcription_task and not transcription_task.done():
+                    logger.info("Cancelling existing transcription task...")
                     cancel_event.set()
                     await transcription_task
+                    logger.info("Previous transcription cancelled")
                 
                 # Clean up old temp file if it exists
                 if temp_audio_path and os.path.exists(temp_audio_path):
+                    logger.info(f"Cleaning up old temp file: {temp_audio_path}")
                     os.unlink(temp_audio_path)
                 
-                # Decode and save audio
-                audio_data = base64.b64decode(audio_base64)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-                    temp_audio.write(audio_data)
-                    temp_audio_path = temp_audio.name
+                # Reset chunk buffer
+                audio_chunks = []
+                receiving_chunks = True
                 
                 await websocket.send_text(json.dumps({
-                    "type": "loaded",
-                    "message": "Audio loaded successfully"
+                    "type": "load_start_ack",
+                    "message": "Ready to receive chunks"
                 }))
+                logger.info("Sent load_start_ack - ready to receive binary chunks")
+            
+            elif command_type == "load_complete":
+                # All chunks received, now process the audio
+                logger.info("Processing 'load_complete' command...")
                 
-                # Start transcription from beginning
-                cancel_event = asyncio.Event()
-                transcription_task = asyncio.create_task(
-                    transcribe_from_position(websocket, temp_audio_path, 0.0, cancel_event)
-                )
+                if not receiving_chunks:
+                    logger.error("Received load_complete but was not receiving chunks")
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Invalid state: not receiving chunks"
+                    }))
+                    continue
+                
+                receiving_chunks = False
+                
+                # Combine all chunks
+                logger.info(f"Combining {len(audio_chunks)} chunks...")
+                audio_data = b"".join(audio_chunks)
+                actual_size = len(audio_data)
+                logger.info(f"Total audio data received: {actual_size} bytes ({actual_size / 1024 / 1024:.2f} MB)")
+                
+                # Verify size matches
+                if expected_total_size > 0 and actual_size != expected_total_size:
+                    logger.warning(f"Size mismatch! Expected {expected_total_size}, got {actual_size}")
+                else:
+                    logger.info(f"✓ Size verification passed")
+                
+                # Save to temp file and convert to WAV
+                try:
+                    # First, save raw data to a temp file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as temp_raw:
+                        temp_raw.write(audio_data)
+                        temp_raw_path = temp_raw.name
+                    
+                    logger.info(f"Raw audio saved to: {temp_raw_path}")
+                    
+                    # Convert raw PCM to WAV using ffmpeg
+                    # Assuming 16kHz, 16-bit PCM mono (matching the QT audio decoder settings)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:
+                        temp_audio_path = temp_wav.name
+                    
+                    logger.info(f"Converting raw PCM to WAV format...")
+                    import subprocess
+                    result = await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "ffmpeg", "-f", "s16le",  # Input format: signed 16-bit little-endian PCM
+                            "-ar", "16000",            # Sample rate: 16kHz
+                            "-ac", "1",                # Channels: 1 (mono)
+                            "-i", temp_raw_path,       # Input file
+                            "-y",                      # Overwrite output
+                            temp_audio_path            # Output WAV file
+                        ],
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    # Clean up raw file
+                    os.unlink(temp_raw_path)
+                    
+                    if result.returncode != 0:
+                        logger.error(f"ffmpeg conversion error: {result.stderr}")
+                        raise Exception(f"Failed to convert audio: {result.stderr}")
+                    
+                    logger.info(f"✓ Audio converted to WAV: {temp_audio_path}")
+                    
+                    import av
+                    with av.open(temp_audio_path, mode="r") as container:
+                        # Try to get basic info to verify file is valid
+                        if container.streams.audio:
+                            logger.info(f"✓ WAV file validated - duration: {container.duration / 1000000:.2f}s")
+                        else:
+                            raise Exception("No audio stream found in file")
+                    
+                    # Clear chunks from memory
+                    audio_chunks = []
+                    
+                    await websocket.send_text(json.dumps({
+                        "type": "loaded",
+                        "message": "Audio loaded successfully",
+                        "temp_path": temp_audio_path,
+                        "size": actual_size
+                    }))
+                    logger.info("Sent 'loaded' confirmation to client")
+                    
+                    # Start transcription from beginning
+                    logger.info("Starting transcription from beginning...")
+                    cancel_event = asyncio.Event()
+                    transcription_task = asyncio.create_task(
+                        transcribe_from_position(websocket, temp_audio_path, 0.0, cancel_event)
+                    )
+                    logger.info("Transcription task created and started")
+                    
+                except Exception as e:
+                    logger.exception(f"Error saving audio file: {e}")
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"Failed to save audio: {str(e)}"
+                    }))
             
             elif command_type == "seek":
                 # Seek to a specific position
+                logger.info("Processing 'seek' command...")
                 seek_time = command.get("seek_time", 0.0)
+                logger.info(f"Seek time: {seek_time}s")
                 
                 if not temp_audio_path:
+                    logger.error("Seek command received but no audio is loaded")
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": "No audio loaded. Use 'load' command first."
@@ -317,16 +448,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Cancel current transcription
                 if transcription_task and not transcription_task.done():
+                    logger.info("Cancelling current transcription for seek...")
                     cancel_event.set()
                     await transcription_task
                 
                 # Start new transcription from seek position
+                logger.info(f"Starting transcription from position {seek_time}s")
                 cancel_event = asyncio.Event()
                 transcription_task = asyncio.create_task(
                     transcribe_from_position(websocket, temp_audio_path, seek_time, cancel_event)
                 )
+                logger.info("Seek transcription task created")
             
             else:
+                logger.warning(f"Received unknown command type: {command_type}")
                 await websocket.send_text(json.dumps({
                     "type": "error",
                     "message": f"Unknown command type: {command_type}"
@@ -334,16 +469,17 @@ async def websocket_endpoint(websocket: WebSocket):
             
     except WebSocketDisconnect:
         # Client disconnected - just clean up
-        pass
+        logger.info("WebSocket client disconnected")
     except Exception as e:
         # Try to send error if connection is still open
+        logger.exception(f"Unexpected error in websocket endpoint: {e}")
         try:
             await websocket.send_text(json.dumps({
                 "type": "error",
                 "message": str(e)
             }))
         except (WebSocketDisconnect, RuntimeError):
-            pass
+            logger.warning("Could not send error to client - connection closed")
     finally:
         # Cancel any running transcription
         if transcription_task and not transcription_task.done():

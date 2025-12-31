@@ -66,10 +66,7 @@ async def test_websocket():
     with open(audio_path, "rb") as f:
         audio_data = f.read()
     
-    logger.info(f"Audio file size: {len(audio_data)} bytes")
-    
-    # Encode audio as base64
-    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+    logger.info(f"Audio file size: {len(audio_data)} bytes ({len(audio_data) / 1024 / 1024:.2f} MB)")
     
     # Connect to WebSocket
     uri = "ws://localhost:8000/ws"
@@ -78,13 +75,36 @@ async def test_websocket():
     async with websockets.connect(uri) as websocket:
         logger.info("Connected!")
         
-        # Send load command
-        logger.info("Sending load command with audio data...")
-        load_command = {
-            "type": "load",
-            "audio_data": audio_base64
+        # Send chunked audio data
+        CHUNK_SIZE = 64 * 1024  # 64KB chunks
+        total_size = len(audio_data)
+        chunk_count = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE  # Ceiling division
+        
+        logger.info(f"Sending load_start command (total_size={total_size}, chunk_count={chunk_count})...")
+        load_start_command = {
+            "type": "load_start",
+            "total_size": total_size,
+            "chunk_count": chunk_count
         }
-        await websocket.send(json.dumps(load_command))
+        await websocket.send(json.dumps(load_start_command))
+        
+        # Wait for acknowledgment
+        ack_message = await websocket.recv()
+        ack_event = json.loads(ack_message)
+        if ack_event.get("type") == "load_start_ack":
+            logger.info("Received load_start_ack, sending chunks...")
+        
+        # Send audio data in chunks
+        for i in range(0, total_size, CHUNK_SIZE):
+            chunk = audio_data[i:i + CHUNK_SIZE]
+            await websocket.send(chunk)  # Send as binary
+            logger.info(f"Sent chunk {i // CHUNK_SIZE + 1}/{chunk_count} ({len(chunk)} bytes)")
+        
+        logger.info("All chunks sent, sending load_complete command...")
+        load_complete_command = {
+            "type": "load_complete"
+        }
+        await websocket.send(json.dumps(load_complete_command))
         
         print(COLOR_SUCCESS + "="*60)
         print("TRANSCRIPTION RESULTS - INITIAL LOAD")
