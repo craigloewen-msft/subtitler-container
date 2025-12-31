@@ -8,6 +8,15 @@ import requests
 from pathlib import Path
 from threading import Thread
 import base64
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    force=True
+)
+logger = logging.getLogger(__name__)
 
 # Color codes
 COLOR_RESET = "\033[0m"
@@ -28,21 +37,21 @@ def stream_output(pipe, prefix, color):
 
 def wait_for_server(timeout=60):
     """Wait for the server to be ready"""
-    print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Waiting for server to be ready...")
+    logger.info("Waiting for server to be ready...")
     start_time = time.time()
     
     while time.time() - start_time < timeout:
         try:
             response = requests.get("http://localhost:8000/")
             if response.status_code == 200:
-                print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Server is ready!")
+                logger.info("Server is ready!")
                 return True
         except requests.exceptions.ConnectionError:
             pass
         time.sleep(1)
         print(f"{COLOR_TEST}.{COLOR_RESET}", end="", flush=True)
     
-    print(f"\n{COLOR_TEST}[TEST]{COLOR_RESET} Timeout waiting for server")
+    logger.error("Timeout waiting for server")
     return False
 
 
@@ -50,27 +59,27 @@ async def test_websocket():
     # Read the audio file
     audio_path = Path("test.mp3")
     if not audio_path.exists():
-        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Error: {audio_path} not found!")
+        logger.error(f"Error: {audio_path} not found!")
         return
     
-    print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Loading audio file: {audio_path}")
+    logger.info(f"Loading audio file: {audio_path}")
     with open(audio_path, "rb") as f:
         audio_data = f.read()
     
-    print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Audio file size: {len(audio_data)} bytes")
+    logger.info(f"Audio file size: {len(audio_data)} bytes")
     
     # Encode audio as base64
     audio_base64 = base64.b64encode(audio_data).decode('utf-8')
     
     # Connect to WebSocket
     uri = "ws://localhost:8000/ws"
-    print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Connecting to {uri}...")
+    logger.info(f"Connecting to {uri}...")
     
     async with websockets.connect(uri) as websocket:
-        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Connected!")
+        logger.info("Connected!")
         
         # Send load command
-        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Sending load command with audio data...")
+        logger.info("Sending load command with audio data...")
         load_command = {
             "type": "load",
             "audio_data": audio_base64
@@ -116,7 +125,7 @@ async def test_websocket():
                     
                     # Send first seek after first few segments
                     if segments_received == 20 and not first_seek_sent:
-                        print(f"\n{COLOR_TEST}[TEST]{COLOR_RESET} Sending first SEEK command to 60s...\n")
+                        logger.info("Sending first SEEK command to 60s...")
                         seek_command = {
                             "type": "seek",
                             "seek_time": 60.0
@@ -126,7 +135,7 @@ async def test_websocket():
                     
                     # Send second seek after 5 segments (of the first seek)
                     elif segments_received == 50 and first_seek_sent and not second_seek_sent:
-                        print(f"\n{COLOR_TEST}[TEST]{COLOR_RESET} Sending second SEEK command to 120s...\n")
+                        logger.info("Sending second SEEK command to 120s...")
                         seek_command = {
                             "type": "seek",
                             "seek_time": 120.0
@@ -149,25 +158,27 @@ async def test_websocket():
                     
                     # If we haven't sent both seeks yet, this was the final completion
                     if second_seek_sent:
-                        print(f"{COLOR_SUCCESS}[TEST]{COLOR_RESET} All seek tests completed successfully!\n")
+                        logger.info(f"{COLOR_SUCCESS}All seek tests completed successfully!{COLOR_RESET}")
                         break
                     
                 elif event["type"] == "error":
-                    print(f"{COLOR_ERROR}[ERROR]{COLOR_RESET} {event['message']}")
+                    logger.error(f"Server error: {event['message']}")
                     break
                     
             except websockets.exceptions.ConnectionClosed:
-                print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Connection closed")
+                logger.warning("Connection closed")
                 break
 
 
 def main():
+    test_start_time = time.time()
+    
     print(COLOR_SUCCESS + "="*60)
     print("WHISPER WEBSOCKET TRANSCRIPTION TEST")
     print("="*60 + COLOR_RESET + "\n")
     
     # Start the server
-    print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Starting server...")
+    logger.info("Starting server...")
     server_process = subprocess.Popen(
         ["uv", "run", "main.py"],
         stdout=subprocess.PIPE,
@@ -190,21 +201,36 @@ def main():
     
     # Wait for server to be ready
     if not wait_for_server():
-        print(f"{COLOR_ERROR}[TEST]{COLOR_RESET} Server failed to start")
+        logger.error("Server failed to start")
         server_process.terminate()
         return
     
     print()  # Add blank line for readability
     
+    success = False
     try:
         # Run the WebSocket test
         asyncio.run(test_websocket())
+        success = True
+    except Exception as e:
+        logger.exception(f"Test failed with error: {e}")
     finally:
         # Stop the server
-        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Stopping server...")
+        logger.info("Stopping server...")
         server_process.terminate()
         server_process.wait()
-        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Server stopped\n")
+        logger.info("Server stopped")
+        
+        # Calculate and display test duration
+        test_duration = time.time() - test_start_time
+        
+        print("\n" + COLOR_SUCCESS + "="*60)
+        if success:
+            print(f"✓ TEST COMPLETED SUCCESSFULLY")
+        else:
+            print(f"{COLOR_ERROR}✗ TEST FAILED{COLOR_SUCCESS}")
+        print(f"Total time: {test_duration:.2f} seconds")
+        print("="*60 + COLOR_RESET + "\n")
 
 
 if __name__ == "__main__":
