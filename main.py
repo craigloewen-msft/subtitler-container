@@ -1,10 +1,12 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
+from starlette.websockets import WebSocketDisconnect
 import uvicorn
-import whisper
+from faster_whisper import WhisperModel
 import json
 import tempfile
 import os
+import asyncio
 from pathlib import Path
 
 app = FastAPI()
@@ -17,7 +19,7 @@ model = None
 async def startup_event():
     global model
     print("Loading Whisper model...")
-    model = whisper.load_model("base")
+    model = WhisperModel("base", device="cpu", compute_type="int8")
     print("Whisper model loaded successfully")
 
 
@@ -29,6 +31,7 @@ async def root():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    temp_audio_path = None
     
     try:
         # Receive audio file data
@@ -39,44 +42,62 @@ async def websocket_endpoint(websocket: WebSocket):
             temp_audio.write(audio_data)
             temp_audio_path = temp_audio.name
         
-        try:
-            # Transcribe with verbose mode to get segments
-            result = model.transcribe(
-                temp_audio_path,
-                verbose=False,
-                task="transcribe"
-            )
-            
-            # Emit each segment as it's available
-            for segment in result["segments"]:
-                subtitle_event = {
-                    "type": "subtitle",
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "text": segment["text"].strip()
-                }
-                await websocket.send_text(json.dumps(subtitle_event))
-            
-            # Send completion event
-            completion_event = {
-                "type": "completed",
-                "full_text": result["text"].strip()
+        # Transcribe with streaming - segments are yielded as they're decoded
+        segments, info = model.transcribe(
+            temp_audio_path,
+            task="transcribe"
+        )
+        
+        full_text_parts = []
+        segment_count = 0
+        # Emit each segment as it's available (true streaming)
+        for segment in segments:
+            segment_count += 1
+            subtitle_event = {
+                "type": "subtitle",
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text.strip()
             }
-            await websocket.send_text(json.dumps(completion_event))
-            
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_audio_path):
-                os.unlink(temp_audio_path)
-                
-    except Exception as e:
-        error_event = {
-            "type": "error",
-            "message": str(e)
+            await websocket.send_text(json.dumps(subtitle_event))
+            full_text_parts.append(segment.text)
+            # Yield control to event loop to keep connection alive
+            await asyncio.sleep(0)
+        
+        print(f"Processed {segment_count} segments")
+        
+        # Send completion event
+        completion_event = {
+            "type": "completed",
+            "full_text": " ".join(full_text_parts).strip()
         }
-        await websocket.send_text(json.dumps(error_event))
+        await websocket.send_text(json.dumps(completion_event))
+            
+    except WebSocketDisconnect:
+        # Client disconnected - just clean up, don't try to send anything
+        pass
+    except Exception as e:
+        # Try to send error if connection is still open
+        try:
+            error_event = {
+                "type": "error",
+                "message": str(e)
+            }
+            await websocket.send_text(json.dumps(error_event))
+        except (WebSocketDisconnect, RuntimeError):
+            # Connection already closed, can't send error
+            pass
     finally:
-        await websocket.close()
+        # Clean up temporary file
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            os.unlink(temp_audio_path)
+        
+        # Try to close the websocket if it's still open
+        try:
+            await websocket.close()
+        except (WebSocketDisconnect, RuntimeError):
+            # Already closed
+            pass
 
 
 if __name__ == "__main__":
