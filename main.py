@@ -1,6 +1,7 @@
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
+from contextlib import asynccontextmanager
 import uvicorn
 from faster_whisper import WhisperModel
 import json
@@ -19,18 +20,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
 VERSION = "0.1.0"
 model = None
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     global model
     logger.info("Loading Whisper model...")
     model = WhisperModel("base", device="cpu", compute_type="int8")
     logger.info("Whisper model loaded successfully")
+    yield
+    # Shutdown (cleanup if needed)
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
