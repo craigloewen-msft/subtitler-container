@@ -106,7 +106,13 @@ async def test_websocket():
                     
                 elif event["type"] == "subtitle":
                     segments_received += 1
-                    print(f"{COLOR_WARNING}[{event['start']:6.2f}s - {event['end']:6.2f}s]{COLOR_RESET} {event['text']}")
+                    original_text = event['text']
+                    english_text = event.get('text_en', original_text)
+                    language = event.get('language', 'unknown')
+                    
+                    print(f"{COLOR_WARNING}[{event['start']:6.2f}s - {event['end']:6.2f}s]{COLOR_RESET} {original_text}")
+                    if language != 'en' and english_text != original_text:
+                        print(f"{COLOR_SUCCESS}                    [EN]{COLOR_RESET} {english_text}")
                     
                     # Send first seek after first few segments
                     if segments_received == 20 and not first_seek_sent:
@@ -130,10 +136,16 @@ async def test_websocket():
                         
                 elif event["type"] == "completed":
                     seek_time = event.get("seek_time", 0)
+                    language = event.get("language", "unknown")
                     print(f"\n{COLOR_SUCCESS}" + "="*60)
-                    print(f"TRANSCRIPTION COMPLETE (from {seek_time}s)")
+                    print(f"TRANSCRIPTION COMPLETE (from {seek_time}s, language: {language})")
                     print("="*60 + COLOR_RESET)
-                    print(f"\n{COLOR_SUCCESS}Full text:{COLOR_RESET} {event['full_text']}\n")
+                    print(f"\n{COLOR_SUCCESS}Full text ({language}):{COLOR_RESET} {event['full_text']}")
+                    
+                    full_text_en = event.get('full_text_en')
+                    if full_text_en and full_text_en != event['full_text']:
+                        print(f"{COLOR_SUCCESS}Full text (en):{COLOR_RESET} {full_text_en}")
+                    print()
                     
                     # If we haven't sent both seeks yet, this was the final completion
                     if second_seek_sent:
