@@ -125,20 +125,20 @@ async def test_websocket():
                     
                     # Send first seek after first few segments
                     if segments_received == 20 and not first_seek_sent:
-                        logger.info("Sending first SEEK command to 60s...")
+                        logger.info("Sending first SEEK command to 160s...")
                         seek_command = {
                             "type": "seek",
-                            "seek_time": 60.0
+                            "seek_time": 160.0
                         }
                         await websocket.send(json.dumps(seek_command))
                         first_seek_sent = True
                     
                     # Send second seek after 5 segments (of the first seek)
                     elif segments_received == 50 and first_seek_sent and not second_seek_sent:
-                        logger.info("Sending second SEEK command to 120s...")
+                        logger.info("Sending second SEEK command to 340s...")
                         seek_command = {
                             "type": "seek",
-                            "seek_time": 120.0
+                            "seek_time": 340.0
                         }
                         await websocket.send(json.dumps(seek_command))
                         second_seek_sent = True

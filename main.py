@@ -73,6 +73,7 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
     Detects language and provides both original and English translation, streaming results.
     Processes both streams simultaneously and sends events as soon as matches are ready.
     """
+    temp_sliced_audio = None
     try:
         # Send processing started event
         await websocket.send_text(json.dumps({
@@ -80,7 +81,34 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
             "seek_time": seek_time
         }))
         
-        # First, do a quick language detection
+        # If seeking, create a sliced version of the audio starting from seek_time
+        if seek_time > 0:
+
+            logger.info(f"Slicing audio from {seek_time}s for transcription...")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_sliced:
+                temp_sliced_audio = temp_sliced.name
+            
+            # Use ffmpeg to slice the audio from seek_time onwards
+            import subprocess
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-i", audio_path, "-ss", str(seek_time), "-c", "copy", temp_sliced_audio, "-y"],
+                capture_output=True,
+                text=True
+            )
+            logger.info(f"ffmpeg output: {result.stdout}")
+            
+            if result.returncode != 0:
+                logger.error(f"ffmpeg error: {result.stderr}")
+                raise Exception(f"Failed to slice audio: {result.stderr}")
+            
+            # Use the sliced audio for transcription
+            transcribe_audio_path = temp_sliced_audio
+        else:
+            # No seeking needed, use original audio
+            transcribe_audio_path = audio_path
+        
+        # First, do a quick language detection (always use original audio for this)
         logger.info("Detecting language...")
         
         def detect_language():
@@ -100,8 +128,11 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
         def produce_segments(task_type: str, queue: asyncio.Queue, loop):
             """Run transcription in thread and put segments into queue"""
             try:
-                segments_iter, _ = model.transcribe(audio_path, task=task_type)
+                segments_iter, _ = model.transcribe(transcribe_audio_path, task=task_type)
                 for segment in segments_iter:
+                    # Adjust timestamps by adding seek_time back
+                    segment.start += seek_time
+                    segment.end += seek_time
                     asyncio.run_coroutine_threadsafe(queue.put(segment), loop).result()
             except Exception as e:
                 logger.error(f"Error in {task_type}: {e}")
@@ -140,10 +171,6 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
             if orig_segment is None:  # Stream ended
                 break
             
-            # Skip segments before seek time
-            if orig_segment.end < seek_time:
-                continue
-            
             # For non-English, wait until we have translation coverage
             if detected_language != "en":
                 # Collect translation segments until we cover this original segment
@@ -165,7 +192,6 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
                         continue
             
             # Now we can send this segment
-            start_time = max(orig_segment.start, seek_time)
             segment_count += 1
             
             # Find matching translation by time overlap
@@ -180,7 +206,7 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
             
             subtitle_event = {
                 "type": "subtitle",
-                "start": start_time,
+                "start": orig_segment.start,
                 "end": orig_segment.end,
                 "text": orig_segment.text.strip(),
                 "text_en": text_en,
@@ -217,6 +243,10 @@ async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_t
                 }))
             except Exception as send_error:
                 logger.error(f"Failed to send error message: {send_error}")
+    finally:
+        # Clean up temporary sliced audio file if created
+        if temp_sliced_audio and os.path.exists(temp_sliced_audio):
+            os.unlink(temp_sliced_audio)
 
 
 @app.websocket("/ws")
