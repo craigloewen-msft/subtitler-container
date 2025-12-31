@@ -8,6 +8,7 @@ import tempfile
 import os
 import asyncio
 from pathlib import Path
+import base64
 
 app = FastAPI()
 
@@ -28,66 +29,172 @@ async def root():
     return JSONResponse({"version": VERSION})
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    temp_audio_path = None
-    
+async def transcribe_from_position(websocket: WebSocket, audio_path: str, seek_time: float, cancel_event: asyncio.Event):
+    """
+    Transcribe audio from a specific position, cancellable via cancel_event.
+    """
     try:
-        # Receive audio file data
-        audio_data = await websocket.receive_bytes()
+        # Send processing started event
+        await websocket.send_text(json.dumps({
+            "type": "processing_started",
+            "seek_time": seek_time
+        }))
         
-        # Save to temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            temp_audio.write(audio_data)
-            temp_audio_path = temp_audio.name
-        
-        # Transcribe with streaming - segments are yielded as they're decoded
+        # Transcribe with streaming
         segments, info = model.transcribe(
-            temp_audio_path,
+            audio_path,
             task="transcribe"
         )
         
         full_text_parts = []
         segment_count = 0
-        # Emit each segment as it's available (true streaming)
+        
+        # Process segments
         for segment in segments:
+            # Check if we should cancel
+            if cancel_event.is_set():
+                await websocket.send_text(json.dumps({
+                    "type": "processing_cancelled",
+                    "seek_time": seek_time
+                }))
+                return
+            
+            # Skip segments that end before the seek time
+            if segment.end < seek_time:
+                continue
+            
+            # For segments that overlap the seek time, adjust the start time
+            start_time = max(segment.start, seek_time)
+            
             segment_count += 1
             subtitle_event = {
                 "type": "subtitle",
-                "start": segment.start,
+                "start": start_time,
                 "end": segment.end,
                 "text": segment.text.strip()
             }
             await websocket.send_text(json.dumps(subtitle_event))
             full_text_parts.append(segment.text)
-            # Yield control to event loop to keep connection alive
+            
+            # Yield control to event loop
             await asyncio.sleep(0)
         
-        print(f"Processed {segment_count} segments")
-        
-        # Send completion event
-        completion_event = {
-            "type": "completed",
-            "full_text": " ".join(full_text_parts).strip()
-        }
-        await websocket.send_text(json.dumps(completion_event))
+        # Only send completion if not cancelled
+        if not cancel_event.is_set():
+            print(f"Processed {segment_count} segments (seek_time: {seek_time}s)")
+            completion_event = {
+                "type": "completed",
+                "full_text": " ".join(full_text_parts).strip(),
+                "seek_time": seek_time
+            }
+            await websocket.send_text(json.dumps(completion_event))
+    except Exception as e:
+        if not cancel_event.is_set():
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": str(e)
+            }))
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    temp_audio_path = None
+    transcription_task = None
+    cancel_event = asyncio.Event()
+    
+    try:
+        while True:
+            # Receive command
+            message_text = await websocket.receive_text()
+            command = json.loads(message_text)
+            command_type = command.get("type")
+            
+            if command_type == "load":
+                # Load audio data
+                audio_base64 = command.get("audio_data")
+                if not audio_base64:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "audio_data is required for load command"
+                    }))
+                    continue
+                
+                # Cancel any existing transcription
+                if transcription_task and not transcription_task.done():
+                    cancel_event.set()
+                    await transcription_task
+                
+                # Clean up old temp file if it exists
+                if temp_audio_path and os.path.exists(temp_audio_path):
+                    os.unlink(temp_audio_path)
+                
+                # Decode and save audio
+                audio_data = base64.b64decode(audio_base64)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+                    temp_audio.write(audio_data)
+                    temp_audio_path = temp_audio.name
+                
+                await websocket.send_text(json.dumps({
+                    "type": "loaded",
+                    "message": "Audio loaded successfully"
+                }))
+                
+                # Start transcription from beginning
+                cancel_event = asyncio.Event()
+                transcription_task = asyncio.create_task(
+                    transcribe_from_position(websocket, temp_audio_path, 0.0, cancel_event)
+                )
+            
+            elif command_type == "seek":
+                # Seek to a specific position
+                seek_time = command.get("seek_time", 0.0)
+                
+                if not temp_audio_path:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "No audio loaded. Use 'load' command first."
+                    }))
+                    continue
+                
+                # Cancel current transcription
+                if transcription_task and not transcription_task.done():
+                    cancel_event.set()
+                    await transcription_task
+                
+                # Start new transcription from seek position
+                cancel_event = asyncio.Event()
+                transcription_task = asyncio.create_task(
+                    transcribe_from_position(websocket, temp_audio_path, seek_time, cancel_event)
+                )
+            
+            else:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": f"Unknown command type: {command_type}"
+                }))
             
     except WebSocketDisconnect:
-        # Client disconnected - just clean up, don't try to send anything
+        # Client disconnected - just clean up
         pass
     except Exception as e:
         # Try to send error if connection is still open
         try:
-            error_event = {
+            await websocket.send_text(json.dumps({
                 "type": "error",
                 "message": str(e)
-            }
-            await websocket.send_text(json.dumps(error_event))
+            }))
         except (WebSocketDisconnect, RuntimeError):
-            # Connection already closed, can't send error
             pass
     finally:
+        # Cancel any running transcription
+        if transcription_task and not transcription_task.done():
+            cancel_event.set()
+            try:
+                await transcription_task
+            except:
+                pass
+        
         # Clean up temporary file
         if temp_audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
@@ -96,7 +203,6 @@ async def websocket_endpoint(websocket: WebSocket):
         try:
             await websocket.close()
         except (WebSocketDisconnect, RuntimeError):
-            # Already closed
             pass
 
 

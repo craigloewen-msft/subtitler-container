@@ -7,6 +7,7 @@ import sys
 import requests
 from pathlib import Path
 from threading import Thread
+import base64
 
 # Color codes
 COLOR_RESET = "\033[0m"
@@ -58,37 +59,89 @@ async def test_websocket():
     
     print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Audio file size: {len(audio_data)} bytes")
     
+    # Encode audio as base64
+    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+    
     # Connect to WebSocket
     uri = "ws://localhost:8000/ws"
     print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Connecting to {uri}...")
     
     async with websockets.connect(uri) as websocket:
-        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Connected! Sending audio data...")
+        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Connected!")
         
-        # Send audio data as bytes
-        await websocket.send(audio_data)
-        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Audio data sent. Waiting for transcription...\n")
+        # Send load command
+        print(f"{COLOR_TEST}[TEST]{COLOR_RESET} Sending load command with audio data...")
+        load_command = {
+            "type": "load",
+            "audio_data": audio_base64
+        }
+        await websocket.send(json.dumps(load_command))
         
         print(COLOR_SUCCESS + "="*60)
-        print("TRANSCRIPTION RESULTS")
+        print("TRANSCRIPTION RESULTS - INITIAL LOAD")
         print("="*60 + COLOR_RESET + "\n")
         
-        # Receive and print subtitle events
+        # Track when to send seek commands
+        segments_received = 0
+        first_seek_sent = False
+        second_seek_sent = False
+        
+        # Receive and print events
         while True:
             try:
                 message = await websocket.recv()
                 event = json.loads(message)
                 
-                if event["type"] == "subtitle":
+                if event["type"] == "loaded":
+                    print(f"{COLOR_SUCCESS}[EVENT]{COLOR_RESET} Audio loaded successfully")
+                    
+                elif event["type"] == "processing_started":
+                    seek_time = event.get("seek_time", 0)
+                    print(f"{COLOR_SUCCESS}[EVENT]{COLOR_RESET} Processing started from {seek_time}s\n")
+                    
+                elif event["type"] == "processing_cancelled":
+                    seek_time = event.get("seek_time", 0)
+                    print(f"\n{COLOR_WARNING}[EVENT]{COLOR_RESET} Processing cancelled (was at {seek_time}s)\n")
+                    segments_received = 0  # Reset counter
+                    
+                elif event["type"] == "subtitle":
+                    segments_received += 1
                     print(f"{COLOR_WARNING}[{event['start']:6.2f}s - {event['end']:6.2f}s]{COLOR_RESET} {event['text']}")
+                    
+                    # Send first seek after first few segments
+                    if segments_received == 20 and not first_seek_sent:
+                        print(f"\n{COLOR_TEST}[TEST]{COLOR_RESET} Sending first SEEK command to 60s...\n")
+                        seek_command = {
+                            "type": "seek",
+                            "seek_time": 60.0
+                        }
+                        await websocket.send(json.dumps(seek_command))
+                        first_seek_sent = True
+                    
+                    # Send second seek after 5 segments (of the first seek)
+                    elif segments_received == 50 and first_seek_sent and not second_seek_sent:
+                        print(f"\n{COLOR_TEST}[TEST]{COLOR_RESET} Sending second SEEK command to 120s...\n")
+                        seek_command = {
+                            "type": "seek",
+                            "seek_time": 120.0
+                        }
+                        await websocket.send(json.dumps(seek_command))
+                        second_seek_sent = True
+                        
                 elif event["type"] == "completed":
+                    seek_time = event.get("seek_time", 0)
                     print(f"\n{COLOR_SUCCESS}" + "="*60)
-                    print("TRANSCRIPTION COMPLETE")
+                    print(f"TRANSCRIPTION COMPLETE (from {seek_time}s)")
                     print("="*60 + COLOR_RESET)
                     print(f"\n{COLOR_SUCCESS}Full text:{COLOR_RESET} {event['full_text']}\n")
-                    break
+                    
+                    # If we haven't sent both seeks yet, this was the final completion
+                    if second_seek_sent:
+                        print(f"{COLOR_SUCCESS}[TEST]{COLOR_RESET} All seek tests completed successfully!\n")
+                        break
+                    
                 elif event["type"] == "error":
-                    print(f"{COLOR_ERROR}[TEST] Error: {event['message']}{COLOR_RESET}")
+                    print(f"{COLOR_ERROR}[ERROR]{COLOR_RESET} {event['message']}")
                     break
                     
             except websockets.exceptions.ConnectionClosed:
