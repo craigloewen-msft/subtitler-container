@@ -11,3 +11,5 @@ wheels/
 
 # etc.
 test.mp3
+
+cache/

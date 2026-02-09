@@ -29,8 +29,9 @@ async def lifespan(app: FastAPI):
     # Startup
     global model
     logger.info("Loading Whisper model...")
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    logger.info("Whisper model loaded successfully")
+    # Use CUDA with float16 for GPU acceleration
+    model = WhisperModel("base", device="cuda", compute_type="float16")
+    logger.info("Whisper model loaded successfully on CUDA GPU")
     yield
     # Shutdown (cleanup if needed)
 
